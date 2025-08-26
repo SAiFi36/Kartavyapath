@@ -1,0 +1,94 @@
+Minimal deploy steps (Debian, 2 servers)
+Roles
+Web: 10.122.0.5 (Flask + Gunicorn + Nginx)
+DB: 10.122.0.6 (MariaDB)
+A) DB server (10.122.0.6)
+Install & start MariaDB
+sudo apt update && sudo apt -y install mariadb-server
+sudo systemctl enable --now mariadb
+Bind to private IP
+sudo sed -i 's/^\s*bind-address.*/bind-address = 10.122.0.6/' /etc/mysql/mariadb.conf.d/50-server.cnf
+echo -e "\n[mysqld]\nskip-name-resolve" | sudo tee -a /etc/mysql/mariadb.conf.d/50-server.cnf > /dev/null
+sudo systemctl restart mariadb
+Create DB + user + grants
+sudo mysql -u root -p
+CREATE DATABASE mytododb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'todo_user'@'10.122.0.5' IDENTIFIED BY 'NewStrongPass!123';
+CREATE USER 'todo_user'@'localhost'  IDENTIFIED BY 'NewStrongPass!123';
+GRANT ALL PRIVILEGES ON mytododb.* TO 'todo_user'@'10.122.0.5';
+GRANT ALL PRIVILEGES ON mytododb.* TO 'todo_user'@'localhost';
+FLUSH PRIVILEGES;
+(If you have the schema file)
+mysql -u root -p mytododb < /path/to/todo-db.sql
+B) Web server (10.122.0.5)
+Install packages
+sudo apt update
+sudo apt -y install python3 python3-venv python3-pip nginx git mysql-client
+Place app & install deps
+sudo mkdir -p /var/www/todo && sudo chown -R $USER: /var/www/todo
+# copy/clone your app into /var/www/todo  (must contain app.py, templates/, requirement.txt)
+cd /var/www/todo
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirement.txt
+Configure environment
+cat > .env <<'ENV'
+SECRET_KEY=change_me
+DB_HOST=10.122.0.6
+DB_USER=todo_user
+DB_PASSWORD=NewStrongPass!123
+DB_NAME=mytododb
+ENV
+Test run (foreground)
+. .venv/bin/activate
+pip install gunicorn
+gunicorn --bind 127.0.0.1:8000 app:app   # Ctrl+C to stop when confirmed
+Run as a service
+sudo adduser --system --group --home /var/www/todo todo
+sudo chown -R todo:todo /var/www/todo
+sudo tee /etc/systemd/system/todo.service > /dev/null <<'UNIT'
+[Unit]
+Description=Gunicorn for ToDo app
+After=network.target
+[Service]
+User=todo
+Group=todo
+WorkingDirectory=/var/www/todo
+Environment="PATH=/var/www/todo/.venv/bin"
+ExecStart=/var/www/todo/.venv/bin/gunicorn --workers 3 --bind 127.0.0.1:8000 app:app
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now todo
+Nginx reverse proxy (serve on port 80)
+sudo tee /etc/nginx/sites-available/todo > /dev/null <<'NGX'
+server {
+    listen 80 default_server;
+    server_name _;
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGX
+sudo ln -sf /etc/nginx/sites-available/todo /etc/nginx/sites-enabled/todo
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+Quick verifications
+Web → Gunicorn
+curl -I http://127.0.0.1:8000/
+Web → Nginx
+curl -I http://localhost/
+Web → DB
+mysql -h 10.122.0.6 -u todo_user -p -e "SHOW TABLES IN mytododb;"
+Logs
+sudo systemctl status todo --no-pager
+sudo journalctl -u todo -e --no-pager
+sudo tail -n 100 /var/log/nginx/error.log
+That’s the minimal, no-frills path from zero → running app.
