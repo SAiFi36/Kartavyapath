@@ -1,0 +1,164 @@
+# Mail Delivery via Brevo (because port 25/587 are blocked)
+
+**Goal:** Send mail from `sunbeam.social` reliably to Gmail by relaying through **Brevo** on **port 2525**.
+**Why:** Your VM’s outbound 25 is blocked (and 587 too). 2525 works from your host.
+
+---
+
+## 1) What you need
+
+* Domain: `sunbeam.social`
+* Mail server (Postfix/Dovecot) at `mail.sunbeam.social` (IP `159.89.162.67`)
+* Brevo account (logged in with Google is fine)
+
+---
+
+## 2) Brevo dashboard: set up credentials & domain
+
+1. **Get SMTP creds**
+   In Brevo: **SMTP & API → SMTP** → note:
+
+   * Host: `smtp-relay.brevo.com`
+   * Username: **your Brevo SMTP login email**
+   * Password: **your Brevo SMTP key**
+   * Ports allowed: **2525** (use this), 587, 465
+
+2. **Authenticate your domain**
+   In Brevo: **Senders & IP → Domains → Add domain → `sunbeam.social` → Authenticate**
+
+   * Add the **DKIM** records Brevo gives you at your DNS (Name.com) until Brevo shows all green.
+
+3. **Add senders**
+   In Brevo: **Senders & IP → Senders → Add** `gajanan@sunbeam.social` and `komal@sunbeam.social`.
+
+> Keep your existing DNS for inbound (A/MX) as-is.
+
+---
+
+## 3) DNS at Name.com (recap)
+
+* **A**: `mail → 159.89.162.67`
+* **MX**: `@ → 10 mail.sunbeam.social`
+* **SPF (TXT)**: keep one line only
+
+  * Safe minimal: `v=spf1 mx -all`
+  * If Brevo asks to include theirs: `v=spf1 mx include:spf.brevo.com -all`
+* **DMARC (TXT)**: `_dmarc → v=DMARC1; p=none; rua=mailto:dmarc@sunbeam.social; fo=1; adkim=r; aspf=r`
+* **DKIM**: use the exact records Brevo showed (already added in step 2).
+
+---
+
+## 4) Postfix: relay everything through Brevo on **2525**
+
+On the **mail VM**:
+
+```bash
+# Put your Brevo SMTP login email + SMTP key here:
+sudo tee /etc/postfix/sasl_passwd >/dev/null <<'EOF'
+[smtp-relay.brevo.com]:2525 YOUR_BREVO_SMTP_LOGIN_EMAIL:YOUR_BREVO_SMTP_KEY
+EOF
+
+sudo postmap /etc/postfix/sasl_passwd
+sudo chmod 600 /etc/postfix/sasl_passwd /etc/postfix/sasl_passwd.db
+
+sudo postconf -e "relayhost = [smtp-relay.brevo.com]:2525"
+sudo postconf -e "smtp_sasl_auth_enable = yes"
+sudo postconf -e "smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd"
+sudo postconf -e "smtp_sasl_security_options = noanonymous"
+sudo postconf -e "smtp_tls_security_level = may"
+sudo postconf -e "smtp_tls_wrappermode = no"
+
+sudo systemctl restart postfix
+```
+
+**Sanity checks:**
+
+```bash
+# Must output your login:key (not empty)
+postmap -q "[smtp-relay.brevo.com]:2525" hash:/etc/postfix/sasl_passwd
+
+# Must show :2525 and the maps above
+postconf -n | egrep '^(relayhost|smtp_sasl_auth_enable|smtp_sasl_password_maps|smtp_tls_security_level|smtp_tls_wrappermode)$'
+```
+
+---
+
+## 5) Roundcube: ensure From: uses the root domain (not @mail.)
+
+```bash
+# Force new identities to use @sunbeam.social
+echo "\$config['mail_domain']='sunbeam.social';" | sudo tee -a /etc/roundcube/config.inc.php
+sudo systemctl reload php8.2-fpm
+
+# Fix any existing identities
+sudo apt -y install sqlite3
+sudo sqlite3 /var/lib/roundcube/db/sqlite.db \
+  "UPDATE identities SET email = replace(email, '@mail.sunbeam.social', '@sunbeam.social');"
+```
+
+---
+
+## 6) Test end-to-end and watch logs
+
+**Send (through your server → Brevo):**
+
+```bash
+STAMP=$(date -u +%FT%TZ)
+swaks --server mail.sunbeam.social --port 587 --tls \
+  --auth-user gajanan --auth-password 'GAJANAN_PASSWORD' \
+  --from gajanan@sunbeam.social --to YOUR_GMAIL@gmail.com \
+  --header "Subject: postfix→brevo:2525 ${STAMP}" \
+  --body "hello ${STAMP}"
+```
+
+**Watch logs:**
+
+```bash
+sudo journalctl -f -u postfix
+```
+
+**Success looks like:**
+
+```
+relay=smtp-relay.brevo.com[...]:2525, ... status=sent
+```
+
+If older mail is stuck, requeue:
+
+```bash
+postqueue -f
+# (optional) clear deferred:
+# postsuper -d ALL deferred
+```
+
+---
+
+## 7) Gmail confirmation
+
+Open the message → **Show original**. Expect:
+
+* **SPF: PASS** (Brevo or your MX)
+* **DKIM: PASS (d=sunbeam.social)** (Brevo’s domain auth)
+* **DMARC: PASS**
+
+If it lands in Spam at first (new domain/IP), warm up for \~1–2 weeks: low volume, real recipients, opens/replies/“Not spam”.
+
+---
+
+## 8) Quick troubleshooting map
+
+* **Timeout to Gmail MX on 25** → normal (provider blocks 25). Use Brevo relay.
+* **Timeout to Brevo on 587/465** → use **2525** (already configured).
+* **`535 5.7.8 Authentication failed`** → wrong Brevo SMTP login/key; re-copy from Brevo’s **SMTP** page and re-run step 4.
+* **`sender not allowed / unverified`** → in Brevo: finish **Domains → Authenticate** + **Senders**.
+* **No `relay=smtp-relay.brevo.com` in logs** → you didn’t send via your server’s submission port; use the `swaks` command above.
+* **From shows `@mail.sunbeam.social`** → apply step 5.
+
+---
+
+### TL;DR
+
+1. Authenticate `sunbeam.social` in **Brevo** (DKIM), add senders.
+2. Point **Postfix → Brevo on port 2525** with SASL creds.
+3. Fix Roundcube identities to `@sunbeam.social`.
+4. Test with `swaks`, watch for `status=sent`, and confirm SPF/DKIM/DMARC = PASS in Gmail.
