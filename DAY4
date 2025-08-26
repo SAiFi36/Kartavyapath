@@ -1,0 +1,166 @@
+# Day 04 — SMTP “works or it didn’t” guide
+
+**Host:** `mail.sunbeam.social` (159.89.162.67)
+**Users:** `gajanan`, `komal`
+**Stack:** Postfix (SMTP) + Dovecot (IMAP/SASL)
+
+---
+
+## 1) Preflight sanity
+
+```bash
+sudo systemctl status postfix --no-pager
+sudo systemctl status dovecot --no-pager
+sudo ss -lntp | grep -E ':(25|587|465|993)\b'
+```
+
+If you don’t see 25 and 587 listening, run the quick fixes in §2 and §3, then re-check.
+
+---
+
+## 2) Make Postfix listen on both IPv4 + IPv6 (fixes “localhost:25 refused”)
+
+```bash
+sudo postconf -e "inet_protocols = all"
+sudo systemctl restart postfix
+sudo ss -lntp | grep -E ':(25|587)\b'
+```
+
+(If you prefer not to change this, just use `127.0.0.1` instead of `localhost` in your tests.)
+
+---
+
+## 3) Ensure submission (587) is enabled and AUTH is offered
+
+```bash
+postconf -M submission/inet || true
+```
+
+If nothing prints, append this block and restart:
+
+```bash
+sudo tee -a /etc/postfix/master.cf >/dev/null <<'MCF'
+submission inet n       -       y       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+MCF
+sudo systemctl restart postfix
+```
+
+---
+
+## 4) Tell Postfix to deliver locally to Maildir and accept your domain
+
+```bash
+sudo postconf -e "home_mailbox = Maildir/"
+sudo postconf -e "mydestination = \$myhostname, \$mydomain, localhost.\$mydomain, localhost"
+sudo systemctl restart postfix
+```
+
+---
+
+## 5) Create Maildirs for both users (safe to re-run)
+
+```bash
+sudo -u komal   bash -lc 'maildirmake.dovecot ~/Maildir || mkdir -p ~/Maildir/{cur,new,tmp}'
+sudo -u gajanan bash -lc 'maildirmake.dovecot ~/Maildir || mkdir -p ~/Maildir/{cur,new,tmp}'
+```
+
+Verify:
+
+```bash
+sudo -u komal   bash -lc 'ls -R ~/Maildir | head'
+sudo -u gajanan bash -lc 'ls -R ~/Maildir | head'
+```
+
+---
+
+## 6) Local delivery test over port 25 (no auth)
+
+```bash
+sudo apt -y install swaks
+swaks --server 127.0.0.1 --port 25 \
+      --from gajanan@sunbeam.social \
+      --to   komal@sunbeam.social \
+      --header "Subject: local 25 test $(date -u +%FT%TZ)" \
+      --body "Hello Komal, local SMTP 25 test."
+```
+
+Watch logs live in another terminal:
+
+```bash
+sudo journalctl -f -u postfix -u dovecot
+```
+
+Check the message landed:
+
+```bash
+sudo -u komal bash -lc 'ls -t ~/Maildir/new | head -1 | xargs -r -I{} sed -n "1,60p" ~/Maildir/new/{}'
+```
+
+---
+
+## 7) Client submission test on 587 (STARTTLS + AUTH)
+
+Replace the password string with the actual system password you set for `gajanan`.
+
+```bash
+swaks -4 --server 127.0.0.1 --port 587 --tls \
+      --auth-user gajanan --auth-password 'GAJANAN_PASSWORD' \
+      --from gajanan@sunbeam.social \
+      --to   komal@sunbeam.social \
+      --header "Subject: 587 auth test $(date -u +%FT%TZ)" \
+      --body "Hello via submission with STARTTLS + AUTH."
+```
+
+You should see “Authentication successful” and “queued as …”.
+Confirm in the journal and Komal’s Maildir as above.
+
+---
+
+## 8) IMAP read test on 993 (Dovecot)
+
+```bash
+openssl s_client -connect 127.0.0.1:993 -servername mail.sunbeam.social -quiet
+```
+
+Then type:
+
+```
+a LOGIN komal KOMAL_PASSWORD
+a SELECT INBOX
+a SEARCH ALL
+a LOGOUT
+```
+
+Expect “a OK Logged in” and message counts.
+
+---
+
+## 9) External send (optional)
+
+If your provider allows outbound 25:
+
+```bash
+swaks --server mail.sunbeam.social --port 587 --tls \
+      --auth-user gajanan --auth-password 'GAJANAN_PASSWORD' \
+      --from gajanan@sunbeam.social \
+      --to   you@gmail.com \
+      --header "Subject: external $(date -u +%FT%TZ)" \
+      --body "Hello from sunbeam.social"
+```
+
+If logs show timeouts to remote MX hosts on port 25, your cloud likely blocks outbound 25. In that case, configure a **relayhost** (SES/Mailgun/SendGrid) for outgoing while keeping inbound working.
+
+---
+
+## 10) If anything still fails, run these and share output
+
+```bash
+sudo ss -lntp | grep -E ':(25|587|465|993)\b'
+sudo postconf -n | egrep '^(inet_protocols|inet_interfaces|myhostname|mydomain|mydestination|home_mailbox|smtpd_sasl_auth_enable|smtpd_tls_cert_file)'
+sudo journalctl -u postfix -u dovecot -n 80 --no-pager
+```
+
