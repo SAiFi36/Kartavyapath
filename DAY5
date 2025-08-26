@@ -1,0 +1,198 @@
+# Day 05 — Webmail (Roundcube) at `https://mail.sunbeam.social`
+
+**Goal:** Install and expose Roundcube Webmail on the **mail VM** (IP `159.89.162.67`) in front of your existing Postfix/Dovecot server.
+
+---
+
+## 0) Prereqs
+
+* DNS: `A mail.sunbeam.social → 159.89.162.67`
+* Open inbound **80/443** to the mail VM
+* Valid cert exists at `/etc/letsencrypt/live/mail.sunbeam.social/{fullchain.pem,privkey.pem}`
+* Mail stack already running (Postfix 25/587, Dovecot 993)
+* Users: `gajanan`, `komal`
+
+---
+
+## 1) Install Roundcube + Nginx + PHP-FPM (Debian)
+
+```bash
+sudo apt update
+sudo apt -y install nginx php-fpm php-mbstring php-xml php-intl php-zip php-gd php-curl php-sqlite3 roundcube-core roundcube-sqlite3
+```
+
+Check PHP-FPM socket (we’ll use it in Nginx):
+
+```bash
+ls /run/php/ | grep fpm.sock
+# expect: php8.2-fpm.sock
+```
+
+---
+
+## 2) Configure Roundcube (IMAP/SMTP to your server)
+
+Edit `/etc/roundcube/config.inc.php`:
+
+```bash
+sudo nano /etc/roundcube/config.inc.php
+```
+
+Add (and remove/disable any old `imap_host` / `smtp_host` directives):
+
+```php
+$config['default_host'] = 'ssl://mail.sunbeam.social';
+$config['default_port'] = 993;
+
+$config['smtp_server'] = 'tls://mail.sunbeam.social';
+$config['smtp_port']   = 587;
+$config['smtp_user']   = '%u';
+$config['smtp_pass']   = '%p';
+
+$config['product_name']    = 'Sunbeam Webmail';
+$config['enable_installer'] = false;
+$config['enable_spellcheck'] = false;
+
+$config['imap_conn_options'] = [
+  'ssl' => ['verify_peer' => true, 'verify_peer_name' => true, 'allow_self_signed' => false],
+];
+$config['smtp_conn_options'] = [
+  'ssl' => ['verify_peer' => true, 'verify_peer_name' => true, 'allow_self_signed' => false],
+];
+```
+
+(Keep your existing `$config['des_key']`.)
+
+---
+
+## 3) Nginx vhost for `mail.sunbeam.social`
+
+Create `/etc/nginx/sites-available/roundcube`:
+
+```bash
+sudo tee /etc/nginx/sites-available/roundcube >/dev/null <<'NGX'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name mail.sunbeam.social;
+    location ^~ /.well-known/acme-challenge/ { root /var/www/letsencrypt; default_type "text/plain"; }
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name mail.sunbeam.social;
+
+    ssl_certificate     /etc/letsencrypt/live/mail.sunbeam.social/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/mail.sunbeam.social/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    add_header Strict-Transport-Security "max-age=86400" always;
+
+    root /var/lib/roundcube/public_html;
+    index index.php;
+
+    location ~* ^/(README|INSTALL|LICENSE|CHANGELOG|composer\.(json|lock)|\.git|\.tx) { deny all; }
+    location ^~ /.well-known/acme-challenge/ { root /var/www/letsencrypt; default_type "text/plain"; }
+
+    location / { try_files $uri $uri/ /index.php?$query_string; }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    }
+}
+NGX
+```
+
+Enable it and reload:
+
+```bash
+sudo mkdir -p /var/www/letsencrypt
+sudo ln -sf /etc/nginx/sites-available/roundcube /etc/nginx/sites-enabled/roundcube
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+---
+
+## 4) Reload PHP-FPM (if you edited config)
+
+```bash
+sudo systemctl reload php8.2-fpm
+```
+
+---
+
+## 5) Verify
+
+```bash
+curl -I http://mail.sunbeam.social
+curl -kI https://mail.sunbeam.social
+```
+
+* HTTP should 301 → HTTPS
+* HTTPS should return 200 (Roundcube login page)
+
+Open **[https://mail.sunbeam.social](https://mail.sunbeam.social)**, log in as `gajanan` or `komal` (their Linux passwords).
+Compose a test mail to `komal@sunbeam.social` and confirm it appears in Komal’s inbox.
+
+---
+
+## 6) Quick troubleshooting (fast checks)
+
+* Show active sites & server\_names:
+
+```bash
+ls -l /etc/nginx/sites-enabled/
+sudo nginx -T | grep -A2 'server_name'
+```
+
+* PHP 502/blank page:
+
+```bash
+sudo journalctl -u php8.2-fpm -n 80 --no-pager
+sudo tail -n 100 /var/log/nginx/error.log
+```
+
+* SMTP send fails from webmail (AUTH not offered on 587):
+
+```bash
+openssl s_client -connect mail.sunbeam.social:587 -starttls smtp -quiet <<<"EHLO test" | grep -i AUTH
+sudo journalctl -u postfix -u dovecot -n 80 --no-pager
+```
+
+---
+
+## 7) Optional polish
+
+* After you’re confident, raise HSTS to a year:
+
+```nginx
+add_header Strict-Transport-Security "max-age=31536000" always;
+```
+
+* Cert renew via webroot (no service stop):
+
+```bash
+sudo certbot certonly --webroot -w /var/www/letsencrypt -d mail.sunbeam.social --force-renewal
+sudo certbot renew --dry-run
+```
+
+* Roundcube plugins (enable in `/etc/roundcube/config.inc.php` once installed):
+
+```php
+$config['plugins'] = ['archive','zipdownload'];
+```
+
+---
+
+### TL;DR
+
+1. Install Roundcube + PHP-FPM + Nginx
+2. Point Roundcube to your IMAPS 993 and SMTP 587 (STARTTLS)
+3. Create Nginx vhost for `mail.sunbeam.social` → `/var/lib/roundcube/public_html`
+4. Reload Nginx/PHP-FPM → open **[https://mail.sunbeam.social](https://mail.sunbeam.social)** and log in
